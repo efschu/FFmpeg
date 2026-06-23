@@ -23,7 +23,7 @@
 #ifndef AVFILTER_VF_VAPOURSYNTH_H
 #define AVFILTER_VF_VAPOURSYNTH_H
 
-#include <VSScript4.h>
+#include <vapoursynth/VSScript4.h>
 #include <pthread.h>
 
 #include "avfilter.h"
