@@ -41,7 +41,6 @@
 
 #include "libavfilter/avfilter.h"
 #include "libavfilter/formats.h"
-#include "libavfilter/internal.h"
 #include "libavfilter/video.h"
 #include "avfilter.h"
 #include "formats.h"
