@@ -840,7 +840,6 @@ const FFFilter ff_vf_vapoursynth = {
     .activate      = activate,
     FILTER_INPUTS(ff_video_default_filterpad),
     FILTER_OUTPUTS(ff_video_default_filterpad),
-    .formats_state = FF_FILTER_FORMATS_QUERY_FUNC2,
-    .query_func2   = query_formats,
+    FILTER_QUERY_FUNC2(query_formats),
     .priv_size     = sizeof(VSContext),
 };
