@@ -955,16 +955,16 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_vf_vapoursynth = {
-    .p.name = "vapoursynth",
-    .p.description = "VapourSynth video filter for in-process filter execution",
-    .p.priv_class = &vapoursynth_class,
-    .init = init,
-    .uninit = uninit,
-    .activate = activate,
+const FFFilter ff_vf_vapoursynth = {
+    .p.name        = "vapoursynth",
+    .p.description = NULL_IF_CONFIG_SMALL("VapourSynth video filter for in-process filter execution"),
+    .p.priv_class  = &vapoursynth_class,
+    .init          = init,
+    .uninit        = uninit,
+    .activate      = activate,
     .query_formats = query_formats,
-    .p.flags = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
-    .inputs = inputs,
-    .outputs = outputs,
-    .priv_size = sizeof(VSContext),
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    .inputs        = inputs,
+    .outputs       = outputs,
+    .priv_size     = sizeof(VSContext),
 };
