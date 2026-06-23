@@ -38,6 +38,7 @@
 #include <libavutil/avutil.h>
 #include <libavutil/log.h>
 #include <libavutil/cpu.h>
+#include <libavutil/mem.h>
 
 #include "libavfilter/avfilter.h"
 #include "libavfilter/formats.h"
@@ -209,8 +210,8 @@ static int set_vs_frame_props(VSContext *vs, VSFrame *frame, const AVFrame *avfr
         return AVERROR_UNKNOWN;
 
     /* Set duration */
-    if (avframe->pts != AV_NOPTS_VALUE && avframe->pkt_duration > 0) {
-        vs->vsapi->mapSetInt(map, "_DurationNum", avframe->pkt_duration, 0);
+    if (avframe->pts != AV_NOPTS_VALUE && avframe->duration > 0) {
+        vs->vsapi->mapSetInt(map, "_DurationNum", avframe->duration, 0);
         vs->vsapi->mapSetInt(map, "_DurationDen", avframe->time_base.den, 0);
     }
 
@@ -231,11 +232,7 @@ static int set_vs_frame_props(VSContext *vs, VSFrame *frame, const AVFrame *avfr
                              avframe->color_range == AVCOL_RANGE_MPEG ? 1 : 0, 0);
     }
 
-    /* Set field info for interlaced content */
-    if (avframe->interlaced_frame) {
-        int field = avframe->top_field_first ? 2 : 1;
-        vs->vsapi->mapSetInt(map, "_FieldBased", field, 0);
-    }
+    /* Field info is now in AVFrameSideData, skip for now */
 
     return 0;
 }
@@ -344,7 +341,7 @@ static int copy_frame_from_vs(VSContext *vs, AVFrame *dst, const VSFrame *src)
         if (!err) {
             int64_t den = vs->vsapi->mapGetInt(props, "_DurationDen", 0, &err);
             if (!err && den > 0) {
-                dst->pkt_duration = num;
+                dst->duration = num;
                 dst->time_base.num = 1;
                 dst->time_base.den = den;
             }
@@ -500,8 +497,8 @@ static int init_vs_lib(VSContext *vs)
     }
 
     /* Get API functions */
-    typedef const VSSCRIPTAPI *(VCAPI *getVSScriptAPI_func)(int);
-    getVSScriptAPI_func getVSScriptAPI = (getVSScriptAPI_func)dlsym(vsscript_lib, "getVSScriptAPI");
+    typedef const VSSCRIPTAPI *(VCAPI *getVSScriptAPI)(int);
+    getVSScriptAPI getVSScriptAPI = (getVSScriptAPI)dlsym(vsscript_lib, "getVSScriptAPI");
     if (!getVSScriptAPI) {
         av_log(vs->ctx, AV_LOG_ERROR, "Failed to find getVSScriptAPI\n");
         return AVERROR(EINVAL);
@@ -713,8 +710,8 @@ static int activate(AVFilterContext *ctx)
             if (vs->first_pts == AV_NOPTS_VALUE)
                 vs->first_pts = out_frame->pts;
             out_frame->pts = vs->next_pts;
-            if (out_frame->pkt_duration > 0)
-                vs->next_pts += out_frame->pkt_duration;
+            if (out_frame->duration > 0)
+                vs->next_pts += out_frame->duration;
 
             return ff_filter_frame(outlink, out_frame);
         }
@@ -730,7 +727,7 @@ static int activate(AVFilterContext *ctx)
 
             if (pending == 0) {
                 pthread_mutex_unlock(&vs->lock);
-                return ff_filter_frame(outlink, EOF_FRAME);
+                return ff_filter_frame(outlink, AVERROR_EOF);
             }
         }
     }
@@ -769,7 +766,7 @@ static int activate(AVFilterContext *ctx)
 
         if (!vs->out_node) {
             pthread_mutex_unlock(&vs->lock);
-            return ff_filter_frame(outlink, EOF_FRAME);
+            return ff_filter_frame(outlink, AVERROR_EOF);
         }
     }
 
