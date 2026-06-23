@@ -11,7 +11,7 @@
  * version 2.1 of the License, or (at your option) any later version.
  *
  * FFmpeg is distributed in the hope that it will be useful,
- * but without any warranty; without even the implied warranty of
+ * but without ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
@@ -55,7 +55,7 @@ typedef struct VSContext {
     VSNode *in_node;
     VSNode *out_node;
 
-    /* Input format - set in config_input, used to create VS frame */
+    /* Input format - set when first frame arrives */
     int in_width;
     int in_height;
     int in_fmt;

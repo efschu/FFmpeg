@@ -35,6 +35,7 @@
 #include "libavutil/log.h"
 #include "libavutil/cpu.h"
 #include "libavutil/mem.h"
+#include "libavutil/thread.h"
 
 #include "avfilter.h"
 #include "filters.h"
@@ -42,21 +43,18 @@
 #include "video.h"
 #include "vf_vapoursynth.h"
 
-/* VapourSynth library names (R73) */
-static const char *vsscript_lib_names[] = {
-#ifdef _WIN32
-    "VSScript.dll",
-#elif defined(__APPLE__)
-    "libvsscript.dylib",
-    "libvapoursynth-script.dylib",
-#else
-    "libvapoursynth-script.so",
-    "libvsscript.so",
+/* FFmpeg 6.0+ uses FILTER_INOUTPADS, FILTER_INPUTS, FILTER_OUTPUTS macros */
+#ifndef FILTER_INPUTS
+#define FILTER_INPUTS(array)  .p.inout = (array), .nb_inputs = FF_ARRAY_ELEMS(array)
 #endif
-};
+#ifndef FILTER_OUTPUTS
+#define FILTER_OUTPUTS(array) .p.inout = (array), .nb_outputs = FF_ARRAY_ELEMS(array)
+#endif
 
 #define OFFSET(x) offsetof(VSContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
+
+/* Filter options - need to be named vs_options to match AVFILTER_DEFINE_CLASS */
 static const AVOption vs_options[] = {
     { "file",        "VapourSynth script file (.vpy)", OFFSET(script_path),
                       AV_OPT_TYPE_STRING, .flags = FLAGS },
@@ -72,106 +70,72 @@ static const AVOption vs_options[] = {
 AVFILTER_DEFINE_CLASS(vapoursynth);
 
 /**
- * Convert FFmpeg pixel format to VapourSynth video format ID.
- * Returns pfNone (0) on failure.
- */
-static int get_vs_video_format(enum AVPixelFormat pix_fmt)
-{
-    switch (pix_fmt) {
-    case AV_PIX_FMT_YUV420P:
-    case AV_PIX_FMT_YUVJ420P:
-        return pfYUV420P8;
-    case AV_PIX_FMT_YUV422P:
-    case AV_PIX_FMT_YUVJ422P:
-        return pfYUV422P8;
-    case AV_PIX_FMT_YUV444P:
-    case AV_PIX_FMT_YUVJ444P:
-        return pfYUV444P8;
-    case AV_PIX_FMT_YUV410P:
-        return pfYUV410P8;
-    case AV_PIX_FMT_YUV411P:
-        return pfYUV411P8;
-    case AV_PIX_FMT_GRAY8:
-        return pfGray8;
-    case AV_PIX_FMT_YUV420P9:
-        return pfYUV420P9;
-    case AV_PIX_FMT_YUV422P9:
-        return pfYUV422P9;
-    case AV_PIX_FMT_YUV444P9:
-        return pfYUV444P9;
-    case AV_PIX_FMT_YUV420P10:
-        return pfYUV420P10;
-    case AV_PIX_FMT_YUV422P10:
-        return pfYUV422P10;
-    case AV_PIX_FMT_YUV444P10:
-        return pfYUV444P10;
-    case AV_PIX_FMT_YUV420P12:
-        return pfYUV420P12;
-    case AV_PIX_FMT_YUV422P12:
-        return pfYUV422P12;
-    case AV_PIX_FMT_YUV444P12:
-        return pfYUV444P12;
-    case AV_PIX_FMT_YUV420P14:
-        return pfYUV420P14;
-    case AV_PIX_FMT_YUV422P14:
-        return pfYUV422P14;
-    case AV_PIX_FMT_YUV444P14:
-        return pfYUV444P14;
-    case AV_PIX_FMT_YUV420P16:
-        return pfYUV420P16;
-    case AV_PIX_FMT_YUV422P16:
-        return pfYUV422P16;
-    case AV_PIX_FMT_YUV444P16:
-        return pfYUV444P16;
-    case AV_PIX_FMT_GRAY16:
-        return pfGray16;
-    default:
-        return pfNone;
-    }
-}
-
-/**
  * Convert VapourSynth video format to FFmpeg pixel format.
- * Returns AV_PIX_FMT_NONE on failure.
+ * Uses the colorFamily, sampleType, bitsPerSample, subSamplingW, subSamplingH
+ * fields from VSVideoFormat.
  */
-static enum AVPixelFormat vs_to_ff_pix_fmt(int vs_format)
+static enum AVPixelFormat vs_to_ff_pix_fmt(const VSVideoFormat *vsfmt)
 {
-    switch (vs_format) {
-    case pfGray8:   return AV_PIX_FMT_GRAY8;
-    case pfGray16:  return AV_PIX_FMT_GRAY16;
-    case pfYUV420P8:   return AV_PIX_FMT_YUV420P;
-    case pfYUV422P8:   return AV_PIX_FMT_YUV422P;
-    case pfYUV444P8:   return AV_PIX_FMT_YUV444P;
-    case pfYUV410P8:   return AV_PIX_FMT_YUV410P;
-    case pfYUV411P8:   return AV_PIX_FMT_YUV411P;
-    case pfYUV420P9:   return AV_PIX_FMT_YUV420P9;
-    case pfYUV422P9:   return AV_PIX_FMT_YUV422P9;
-    case pfYUV444P9:   return AV_PIX_FMT_YUV444P9;
-    case pfYUV420P10:  return AV_PIX_FMT_YUV420P10;
-    case pfYUV422P10:  return AV_PIX_FMT_YUV422P10;
-    case pfYUV444P10:  return AV_PIX_FMT_YUV444P10;
-    case pfYUV420P12:  return AV_PIX_FMT_YUV420P12;
-    case pfYUV422P12:  return AV_PIX_FMT_YUV422P12;
-    case pfYUV444P12:  return AV_PIX_FMT_YUV444P12;
-    case pfYUV420P14:  return AV_PIX_FMT_YUV420P14;
-    case pfYUV422P14:  return AV_PIX_FMT_YUV422P14;
-    case pfYUV444P14:  return AV_PIX_FMT_YUV444P14;
-    case pfYUV420P16:  return AV_PIX_FMT_YUV420P16;
-    case pfYUV422P16:  return AV_PIX_FMT_YUV422P16;
-    case pfYUV444P16:  return AV_PIX_FMT_YUV444P16;
-    default:         return AV_PIX_FMT_NONE;
+    if (vsfmt->colorFamily == cfGray) {
+        if (vsfmt->sampleType == stInteger) {
+            if (vsfmt->bitsPerSample == 8) return AV_PIX_FMT_GRAY8;
+            if (vsfmt->bitsPerSample == 16) return AV_PIX_FMT_GRAY16;
+        } else if (vsfmt->sampleType == stFloat) {
+            if (vsfmt->bitsPerSample == 16) return AV_PIX_FMT_GRAYF16;
+            if (vsfmt->bitsPerSample == 32) return AV_PIX_FMT_GRAYF32;
+        }
+        return AV_PIX_FMT_NONE;
     }
+
+    if (vsfmt->colorFamily == cfRGB) {
+        if (vsfmt->sampleType == stInteger) {
+            if (vsfmt->bitsPerSample == 8)  return AV_PIX_FMT_RGB24;
+            if (vsfmt->bitsPerSample == 10) return AV_PIX_FMT_RGB48;
+        }
+        return AV_PIX_FMT_NONE;
+    }
+
+    if (vsfmt->colorFamily == cfYUV) {
+        if (vsfmt->sampleType == stInteger) {
+            if (vsfmt->subSamplingW == 1 && vsfmt->subSamplingH == 1) {
+                if (vsfmt->bitsPerSample == 8)  return AV_PIX_FMT_YUV420P;
+                if (vsfmt->bitsPerSample == 9)  return AV_PIX_FMT_YUV420P9;
+                if (vsfmt->bitsPerSample == 10) return AV_PIX_FMT_YUV420P10;
+                if (vsfmt->bitsPerSample == 12) return AV_PIX_FMT_YUV420P12;
+                if (vsfmt->bitsPerSample == 14) return AV_PIX_FMT_YUV420P14;
+                if (vsfmt->bitsPerSample == 16) return AV_PIX_FMT_YUV420P16;
+            } else if (vsfmt->subSamplingW == 1 && vsfmt->subSamplingH == 0) {
+                if (vsfmt->bitsPerSample == 8)  return AV_PIX_FMT_YUV422P;
+                if (vsfmt->bitsPerSample == 9)  return AV_PIX_FMT_YUV422P9;
+                if (vsfmt->bitsPerSample == 10) return AV_PIX_FMT_YUV422P10;
+                if (vsfmt->bitsPerSample == 12) return AV_PIX_FMT_YUV422P12;
+                if (vsfmt->bitsPerSample == 14) return AV_PIX_FMT_YUV422P14;
+                if (vsfmt->bitsPerSample == 16) return AV_PIX_FMT_YUV422P16;
+            } else if (vsfmt->subSamplingW == 0 && vsfmt->subSamplingH == 0) {
+                if (vsfmt->bitsPerSample == 8)  return AV_PIX_FMT_YUV444P;
+                if (vsfmt->bitsPerSample == 9)  return AV_PIX_FMT_YUV444P9;
+                if (vsfmt->bitsPerSample == 10) return AV_PIX_FMT_YUV444P10;
+                if (vsfmt->bitsPerSample == 12) return AV_PIX_FMT_YUV444P12;
+                if (vsfmt->bitsPerSample == 14) return AV_PIX_FMT_YUV444P14;
+                if (vsfmt->bitsPerSample == 16) return AV_PIX_FMT_YUV444P16;
+            }
+        }
+        return AV_PIX_FMT_NONE;
+    }
+
+    return AV_PIX_FMT_NONE;
 }
 
 /**
- * Copy frame data from FFmpeg to VapourSynth.
+ * Copy frame data from FFmpeg AVFrame to VapourSynth VSFrame.
  */
 static int copy_frame_to_vs(const VSAPI *vsapi, VSFrame *dst,
-                            const AVFrame *src, const VSVideoFormat *vsfmt)
+                            const AVFrame *src)
 {
+    const VSVideoFormat *vsfmt = vsapi->getVideoFrameFormat(dst);
     int width = vsapi->getFrameWidth(dst, 0);
     int height = vsapi->getFrameHeight(dst, 0);
-    int num_planes = vsfmt->numPlanes;
+    int num_planes = vsapi->getFramePlaneCount(dst);
     int bytes_per_sample = (vsfmt->bitsPerSample + 7) >> 3;
 
     for (int p = 0; p < num_planes && p < AV_NUM_DATA_POINTERS; p++) {
@@ -197,20 +161,23 @@ static int copy_frame_to_vs(const VSAPI *vsapi, VSFrame *dst,
 }
 
 /**
- * Copy frame data from VapourSynth to FFmpeg.
+ * Copy frame data from VapourSynth VSFrame to FFmpeg AVFrame.
  */
 static int copy_frame_from_vs(const VSAPI *vsapi, AVFrame *dst,
-                              const VSFrame *src, int vs_format,
-                              int width, int height)
+                              const VSFrame *src)
 {
     const VSVideoFormat *vsfmt = vsapi->getVideoFrameFormat(src);
+    int width = vsapi->getFrameWidth(src, 0);
+    int height = vsapi->getFrameHeight(src, 0);
+    int num_planes = vsapi->getFramePlaneCount(src);
+    int bytes_per_sample = (vsfmt->bitsPerSample + 7) >> 3;
 
-    enum AVPixelFormat out_fmt = vs_to_ff_pix_fmt(vs_format);
+    enum AVPixelFormat out_fmt = vs_to_ff_pix_fmt(vsfmt);
     if (out_fmt == AV_PIX_FMT_NONE) {
         return AVERROR(EINVAL);
     }
 
-    if (dst->format != out_fmt || dst->width != width || dst->height != height) {
+    if (dst->format != (int)out_fmt || dst->width != width || dst->height != height) {
         av_frame_unref(dst);
         dst->format = out_fmt;
         dst->width = width;
@@ -219,9 +186,6 @@ static int copy_frame_from_vs(const VSAPI *vsapi, AVFrame *dst,
         if (ret < 0)
             return ret;
     }
-
-    int num_planes = vsfmt->numPlanes;
-    int bytes_per_sample = (vsfmt->bitsPerSample + 7) >> 3;
 
     for (int p = 0; p < num_planes && p < AV_NUM_DATA_POINTERS; p++) {
         const uint8_t *src_ptr = vsapi->getReadPtr(src, p);
@@ -249,12 +213,12 @@ static int copy_frame_from_vs(const VSAPI *vsapi, AVFrame *dst,
  * VapourSynth input filter callback - provides frames to VS.
  * Called by VapourSynth when it needs an input frame.
  */
-static const VSFrame *VS_CC vs_infilter_get_frame(int frameno, int activationReason,
+static const VSFrame *VS_CC vs_infilter_get_frame(int n, int activationReason,
                                                   void *instanceData, void **frameData,
                                                   VSFrameContext *frameCtx, VSCore *core,
                                                   const VSAPI *vsapi)
 {
-    VSContext *vs = instanceData;
+    VSContext *vs = (VSContext *)instanceData;
     VSFrame *ret = NULL;
 
     pthread_mutex_lock(&vs->lock);
@@ -265,33 +229,71 @@ static const VSFrame *VS_CC vs_infilter_get_frame(int frameno, int activationRea
         return NULL;
     }
 
-    /* Wait for the requested frame to be buffered */
-    while (1) {
-        if (frameno >= vs->in_frameno &&
-            frameno < vs->in_frameno + vs->num_buffered) {
-            AVFrame *avframe = vs->buffered[frameno - vs->in_frameno];
-            int vs_format = get_vs_video_format(avframe->format);
-            if (vs_format == pfNone) {
-                vsapi->setFilterError("Unsupported pixel format", frameCtx);
+    /* Check if requested frame is available in buffer */
+    if (n >= vs->in_frameno && n < vs->in_frameno + vs->num_buffered) {
+        AVFrame *avframe = vs->buffered[n - vs->in_frameno];
+
+        /* Convert pixel format to VapourSynth */
+        int vs_format = 0;
+        if (avframe->format == AV_PIX_FMT_YUV420P) vs_format = pfYUV420P8;
+        else if (avframe->format == AV_PIX_FMT_YUV422P) vs_format = pfYUV422P8;
+        else if (avframe->format == AV_PIX_FMT_YUV444P) vs_format = pfYUV444P8;
+        else if (avframe->format == AV_PIX_FMT_YUV420P10) vs_format = pfYUV420P10;
+        else if (avframe->format == AV_PIX_FMT_YUV420P12) vs_format = pfYUV420P12;
+        else if (avframe->format == AV_PIX_FMT_YUV422P10) vs_format = pfYUV422P10;
+        else if (avframe->format == AV_PIX_FMT_YUV444P10) vs_format = pfYUV444P10;
+        else if (avframe->format == AV_PIX_FMT_GRAY8) vs_format = pfGray8;
+        else if (avframe->format == AV_PIX_FMT_GRAY16) vs_format = pfGray16;
+
+        if (vs_format == 0) {
+            vsapi->setFilterError("Unsupported pixel format", frameCtx);
+            pthread_mutex_unlock(&vs->lock);
+            return NULL;
+        }
+
+        /* Get the format descriptor */
+        VSVideoFormat vsfmt;
+        if (!vsapi->getVideoFormatByID(&vsfmt, vs_format, core)) {
+            vsapi->setFilterError("Cannot get format descriptor", frameCtx);
+            pthread_mutex_unlock(&vs->lock);
+            return NULL;
+        }
+
+        ret = vsapi->newVideoFrame(&vsfmt, avframe->width, avframe->height, NULL, core);
+        if (ret) {
+            copy_frame_to_vs(vsapi, ret, avframe);
+        }
+    } else if (vs->eof) {
+        vsapi->setFilterError("End of file", frameCtx);
+    } else {
+        /* Wait for the requested frame */
+        while (!vs->done && !vs->failed && !vs->eof) {
+            if (n < vs->in_frameno + vs->num_buffered)
                 break;
-            }
-            const VSVideoFormat *vsfmt = vsapi->getVideoFormatDescriptor(vs_format);
-            ret = vsapi->newVideoFrame(vsfmt, avframe->width, avframe->height, NULL, core);
-            if (ret) {
-                copy_frame_to_vs(vsapi, ret, avframe, vsfmt);
-            }
-            break;
+            pthread_cond_broadcast(&vs->input_wakeup);
+            pthread_cond_wait(&vs->vs_wakeup, &vs->lock);
         }
 
-        if (vs->eof) {
+        if (n >= vs->in_frameno && n < vs->in_frameno + vs->num_buffered) {
+            /* Re-attempt after wakeup */
+            AVFrame *avframe = vs->buffered[n - vs->in_frameno];
+
+            int vs_format = 0;
+            if (avframe->format == AV_PIX_FMT_YUV420P) vs_format = pfYUV420P8;
+            else if (avframe->format == AV_PIX_FMT_YUV420P10) vs_format = pfYUV420P10;
+
+            if (vs_format) {
+                VSVideoFormat vsfmt;
+                if (vsapi->getVideoFormatByID(&vsfmt, vs_format, core)) {
+                    ret = vsapi->newVideoFrame(&vsfmt, avframe->width, avframe->height, NULL, core);
+                    if (ret) {
+                        copy_frame_to_vs(vsapi, ret, avframe);
+                    }
+                }
+            }
+        } else if (vs->eof) {
             vsapi->setFilterError("End of file", frameCtx);
-            break;
         }
-
-        /* Signal that we want more input */
-        pthread_cond_broadcast(&vs->input_wakeup);
-        /* Wait for more input or shutdown */
-        pthread_cond_wait(&vs->vs_wakeup, &vs->lock);
     }
 
     pthread_mutex_unlock(&vs->lock);
@@ -304,25 +306,22 @@ static const VSFrame *VS_CC vs_infilter_get_frame(int frameno, int activationRea
 static void VS_CC vs_infilter_free(void *instanceData, VSCore *core,
                                     const VSAPI *vsapi)
 {
-    VSContext *vs = instanceData;
+    VSContext *vs = (VSContext *)instanceData;
     pthread_mutex_lock(&vs->lock);
     pthread_cond_signal(&vs->input_wakeup);
     pthread_mutex_unlock(&vs->lock);
 }
 
 /**
- * VapourSynth output callback - called when a frame is ready.
+ * VapourSynth frame completion callback.
  */
 static void VS_CC vs_frame_done(void *userData, const VSFrame *f, int n,
                                 VSNode *node, const char *errorMsg)
 {
-    VSContext *vs = userData;
-    AVFilterContext *ctx = vs->ctx;
-
+    VSContext *vs = (VSContext *)userData;
     pthread_mutex_lock(&vs->lock);
 
     if (errorMsg && !f) {
-        av_log(ctx, AV_LOG_ERROR, "VS filter error at frame %d: %s\n", n, errorMsg);
         vs->failed = 1;
         pthread_cond_broadcast(&vs->vs_wakeup);
         pthread_mutex_unlock(&vs->lock);
@@ -332,13 +331,11 @@ static void VS_CC vs_frame_done(void *userData, const VSFrame *f, int n,
     if (f) {
         int idx = n - vs->out_frameno;
         if (idx >= 0 && idx < vs->max_requests) {
-            /* Drop the old frame if any */
             if (vs->vs_frames[idx])
                 vs->vsapi->freeFrame(vs->vs_frames[idx]);
             vs->vs_frames[idx] = (VSFrame *)f;
             vs->vs_frame_numbers[idx] = n;
         } else {
-            /* Out of range - drop it */
             vs->vsapi->freeFrame((VSFrame *)f);
         }
     }
@@ -353,59 +350,48 @@ static void VS_CC vs_frame_done(void *userData, const VSFrame *f, int n,
 static int init_vs_lib(VSContext *vs)
 {
     void *vsscript_lib = NULL;
-    const char *vsscript_path = getenv("VSSCRIPT_PATH");
 
-    /* Try explicit path first */
-    if (vsscript_path) {
-        vsscript_lib = dlopen(vsscript_path, RTLD_NOW | RTLD_GLOBAL);
-    }
-    /* Try default names */
-    if (!vsscript_lib) {
-        for (size_t i = 0; i < FF_ARRAY_ELEMS(vsscript_lib_names); i++) {
-            vsscript_lib = dlopen(vsscript_lib_names[i], RTLD_NOW | RTLD_GLOBAL);
-            if (vsscript_lib)
-                break;
-        }
+    /* Try common library names */
+    const char *lib_names[] = {
+        "libvapoursynth-script.so",
+        "libvsscript.so",
+        NULL
+    };
+
+    for (int i = 0; lib_names[i]; i++) {
+        vsscript_lib = dlopen(lib_names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (vsscript_lib) break;
     }
 
     if (!vsscript_lib) {
-        av_log(vs->ctx, AV_LOG_ERROR,
-               "Failed to load VapourSynth script library: %s\n",
-               dlerror() ? dlerror() : "unknown error");
+        av_log(vs->ctx, AV_LOG_ERROR, "Cannot open VapourSynth script library: %s\n", dlerror());
         return AVERROR(EINVAL);
     }
 
     /* Get VSScript API */
     int (*getAPIVersion)(void) = dlsym(vsscript_lib, "vsscriptGetAPIVersion");
     if (!getAPIVersion) {
-        av_log(vs->ctx, AV_LOG_ERROR, "Failed to find vsscriptGetAPIVersion\n");
+        av_log(vs->ctx, AV_LOG_ERROR, "Cannot find vsscriptGetAPIVersion\n");
         return AVERROR(EINVAL);
     }
-    int api_version = getAPIVersion();
-    av_log(vs->ctx, AV_LOG_DEBUG, "VSScript API version: %d.%d\n",
-           api_version >> 16, api_version & 0xFFFF);
 
-    /* Get VSSCRIPTAPI struct */
     typedef const VSSCRIPTAPI *(*getVSScriptAPI_t)(int version);
     getVSScriptAPI_t getVSScriptAPI = dlsym(vsscript_lib, "getVSScriptAPI");
     if (!getVSScriptAPI) {
-        av_log(vs->ctx, AV_LOG_ERROR, "Failed to find getVSScriptAPI\n");
-        return AVERROR(EINVAL);
-    }
-    vs->vs_script_api = getVSScriptAPI(VSSCRIPT_API_VERSION);
-    if (!vs->vs_script_api) {
-        av_log(vs->ctx, AV_LOG_ERROR,
-               "Failed to get VSScript API v%d.%d\n",
-               VSSCRIPT_API_VERSION >> 16, VSSCRIPT_API_VERSION & 0xFFFF);
+        av_log(vs->ctx, AV_LOG_ERROR, "Cannot find getVSScriptAPI\n");
         return AVERROR(EINVAL);
     }
 
-    /* Get VSAPI from VSScript API (no need to dlopen libvapoursynth separately) */
+    vs->vs_script_api = getVSScriptAPI(VSSCRIPT_API_VERSION);
+    if (!vs->vs_script_api) {
+        av_log(vs->ctx, AV_LOG_ERROR, "VSScript API version not supported\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* Get VSAPI from VSScript API */
     vs->vsapi = vs->vs_script_api->getVSAPI(VAPOURSYNTH_API_VERSION);
     if (!vs->vsapi) {
-        av_log(vs->ctx, AV_LOG_ERROR,
-               "Failed to get VSAPI v%d.%d\n",
-               VAPOURSYNTH_API_VERSION >> 16, VAPOURSYNTH_API_VERSION & 0xFFFF);
+        av_log(vs->ctx, AV_LOG_ERROR, "VSAPI version not supported\n");
         return AVERROR(EINVAL);
     }
 
@@ -413,11 +399,12 @@ static int init_vs_lib(VSContext *vs)
 }
 
 /**
- * Load and evaluate VapourSynth script.
+ * Load and evaluate the VapourSynth script.
  */
 static int load_vs_script(VSContext *vs)
 {
     AVFilterContext *ctx = vs->ctx;
+    int ret;
 
     /* Create the script */
     vs->vs_script = vs->vs_script_api->createScript(NULL);
@@ -441,19 +428,33 @@ static int load_vs_script(VSContext *vs)
     vs->vsapi->setThreadCount(vs->nb_threads, vs->vscore);
 
     /* Create the input filter node */
-    int in_vs_format = get_vs_video_format(vs->in_fmt);
-    if (in_vs_format == pfNone) {
+    int in_vs_format = 0;
+    if (vs->in_fmt == AV_PIX_FMT_YUV420P) in_vs_format = pfYUV420P8;
+    else if (vs->in_fmt == AV_PIX_FMT_YUV420P10) in_vs_format = pfYUV420P10;
+    else if (vs->in_fmt == AV_PIX_FMT_YUV420P12) in_vs_format = pfYUV420P12;
+    else if (vs->in_fmt == AV_PIX_FMT_YUV422P) in_vs_format = pfYUV422P8;
+    else if (vs->in_fmt == AV_PIX_FMT_YUV444P) in_vs_format = pfYUV444P8;
+    else if (vs->in_fmt == AV_PIX_FMT_GRAY8) in_vs_format = pfGray8;
+    else if (vs->in_fmt == AV_PIX_FMT_GRAY16) in_vs_format = pfGray16;
+
+    if (in_vs_format == 0) {
         av_log(ctx, AV_LOG_ERROR, "Unsupported input pixel format\n");
         return AVERROR(EINVAL);
     }
-    const VSVideoFormat *in_vsfmt = vs->vsapi->getVideoFormatDescriptor(in_vs_format);
 
-    VSVideoInfo vi_in = {
-        .format = *in_vsfmt,
-        .width = vs->in_width,
-        .height = vs->in_height,
-        .numFrames = INT_MAX / 16,
-    };
+    VSVideoFormat vi_in_fmt;
+    if (!vs->vsapi->getVideoFormatByID(&vi_in_fmt, in_vs_format, vs->vscore)) {
+        av_log(ctx, AV_LOG_ERROR, "Cannot get format descriptor for input\n");
+        return AVERROR(EINVAL);
+    }
+
+    VSVideoInfo vi_in;
+    vi_in.format = vi_in_fmt;
+    vi_in.fpsNum = 0;
+    vi_in.fpsDen = 1;
+    vi_in.width = vs->in_width;
+    vi_in.height = vs->in_height;
+    vi_in.numFrames = INT_MAX;
 
     vs->in_node = vs->vsapi->createVideoFilter2(
         "FFmpegInput", &vi_in,
@@ -465,7 +466,7 @@ static int load_vs_script(VSContext *vs)
         return AVERROR(EINVAL);
     }
 
-    /* Set up script variables (clip, w, h) */
+    /* Set up script variables */
     VSMap *vars = vs->vsapi->createMap();
     vs->vsapi->mapSetNode(vars, "clip", vs->in_node, maReplace);
     vs->vsapi->mapSetInt(vars, "w", vs->in_width, maReplace);
@@ -512,31 +513,26 @@ static void request_vs_frames(VSContext *vs)
     for (int i = 0; i < vs->max_requests; i++) {
         if (!vs->vs_frames[i]) {
             int frame_num = vs->out_frameno + i;
-            vs->vsapi->getFrameAsync(frame_num, vs->out_node,
-                                    vs_frame_done, vs);
+            vs->vsapi->getFrameAsync(frame_num, vs->out_node, vs_frame_done, vs);
         }
     }
 }
 
 /**
  * Get a ready frame from the buffer.
- * Returns 0 if a frame was retrieved (and *out_frame is set).
- * Returns AVERROR(EAGAIN) if no frame is ready yet.
  */
 static int get_ready_frame(VSContext *vs, AVFrame **out_frame)
 {
     for (int i = 0; i < vs->max_requests; i++) {
         if (vs->vs_frames[i]) {
             const VSFrame *src = vs->vs_frames[i];
-            int frame_num = vs->vs_frame_numbers[i];
-            const VSVideoInfo *vi = vs->vsapi->getVideoInfo(vs->out_node);
 
             AVFrame *out = av_frame_alloc();
             if (!out)
                 return AVERROR(ENOMEM);
 
-            int ret = copy_frame_from_vs(vs->vsapi, out, src, vi->format.id,
-                                         vs->out_width, vs->out_height);
+            int ret = copy_frame_from_vs(vs->vsapi, out, src);
+            int frame_num = vs->vs_frame_numbers[i];
             vs->vsapi->freeFrame(vs->vs_frames[i]);
             vs->vs_frames[i] = NULL;
             vs->vs_frame_numbers[i] = -1;
@@ -554,9 +550,6 @@ static int get_ready_frame(VSContext *vs, AVFrame **out_frame)
     return AVERROR(EAGAIN);
 }
 
-/**
- * Check if all pending frames are done (no more output).
- */
 static int pending_frames(VSContext *vs)
 {
     for (int i = 0; i < vs->max_requests; i++) {
@@ -567,22 +560,21 @@ static int pending_frames(VSContext *vs)
 }
 
 /**
- * Filter activate function.
+ * Filter activation function - called when FFmpeg wants frames.
  */
 static int activate(AVFilterContext *ctx)
 {
-    VSContext *vs = ctx->priv;
+    VSContext *vs = (VSContext *)ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
     int ret;
 
     pthread_mutex_lock(&vs->lock);
 
-    /* First-time initialization (after we know the input format) */
+    /* First-time initialization */
     if (!vs->initialized && !vs->initializing && !vs->failed) {
         AVFrame *first_frame = NULL;
 
-        /* Need a first frame to know the input format */
         if (vs->num_buffered == 0) {
             pthread_mutex_unlock(&vs->lock);
             ret = ff_inlink_consume_frame(inlink, &first_frame);
@@ -600,13 +592,11 @@ static int activate(AVFilterContext *ctx)
             vs->in_height = first_frame->height;
             vs->in_fmt = first_frame->format;
 
-            /* Buffer it */
             if (vs->num_buffered == 0) {
                 vs->buffered[0] = first_frame;
                 vs->num_buffered = 1;
             }
 
-            /* Load VapourSynth */
             vs->initializing = 1;
             pthread_mutex_unlock(&vs->lock);
 
@@ -620,19 +610,20 @@ static int activate(AVFilterContext *ctx)
             if (ret < 0) {
                 vs->failed = 1;
                 pthread_mutex_unlock(&vs->lock);
-                av_frame_free(&first_frame);
                 return ret;
             }
 
             vs->initialized = 1;
 
-            /* Notify the system that output format changed */
+            /* Notify that output format changed */
             outlink->w = vs->out_width;
             outlink->h = vs->out_height;
-            outlink->format = vs_to_ff_pix_fmt(
-                vs->vsapi->getVideoInfo(vs->out_node)->format.id);
+            const VSVideoInfo *vi_out = vs->vsapi->getVideoInfo(vs->out_node);
+            enum AVPixelFormat pix_fmt = vs_to_ff_pix_fmt(&vi_out->format);
+            if (pix_fmt != AV_PIX_FMT_NONE) {
+                outlink->format = pix_fmt;
+            }
 
-            /* Start requesting frames */
             request_vs_frames(vs);
         }
     }
@@ -644,7 +635,6 @@ static int activate(AVFilterContext *ctx)
 
         ret = get_ready_frame(vs, &out_frame);
         if (ret == 0 && out_frame) {
-            /* Set output PTS */
             if (vs->first_pts == AV_NOPTS_VALUE)
                 vs->first_pts = out_frame->pts;
             if (out_frame->pts == AV_NOPTS_VALUE)
@@ -656,7 +646,6 @@ static int activate(AVFilterContext *ctx)
 
         pthread_mutex_lock(&vs->lock);
 
-        /* Check for EOF */
         if (vs->eof && vs->num_buffered == 0 && !pending_frames(vs)) {
             pthread_mutex_unlock(&vs->lock);
             return AVERROR_EOF;
@@ -677,7 +666,6 @@ static int activate(AVFilterContext *ctx)
 
         pthread_mutex_lock(&vs->lock);
 
-        /* Check for format change */
         if (vs->initialized) {
             if (frame->width != vs->in_width || frame->height != vs->in_height ||
                 frame->format != vs->in_fmt) {
@@ -703,12 +691,10 @@ static int activate(AVFilterContext *ctx)
         }
     }
 
-    /* Request more output frames if needed */
     if (vs->initialized) {
         request_vs_frames(vs);
     }
 
-    /* Request more input if buffer has space */
     if (vs->num_buffered < vs->maxbuffer && !vs->eof) {
         ff_inlink_request_frame(inlink);
     }
@@ -718,21 +704,17 @@ static int activate(AVFilterContext *ctx)
 }
 
 /**
- * Query supported pixel formats.
+ * Query supported formats (modern FFmpeg 6.0+).
  */
-static int query_formats(AVFilterContext *ctx,
+static int query_formats(const AVFilterContext *ctx,
                          AVFilterFormatsConfig **cfg_in,
                          AVFilterFormatsConfig **cfg_out)
 {
     static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVJ422P,
-        AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUVJ444P,
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV420P9,  AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV420P14, AV_PIX_FMT_YUV420P16,
-        AV_PIX_FMT_YUV422P9,  AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV422P16,
-        AV_PIX_FMT_YUV444P9,  AV_PIX_FMT_YUV444P10, AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV444P16,
-        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY16,
+        AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV420P10,  AV_PIX_FMT_YUV420P12,
+        AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV422P10,
+        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV444P10,
+        AV_PIX_FMT_GRAY8,     AV_PIX_FMT_GRAY16,
         AV_PIX_FMT_NONE
     };
 
@@ -741,44 +723,11 @@ static int query_formats(AVFilterContext *ctx,
 }
 
 /**
- * Configure input link.
- */
-static int config_input(AVFilterLink *inlink)
-{
-    AVFilterContext *ctx = inlink->dst;
-    VSContext *vs = ctx->priv;
-
-    vs->in_width = inlink->w;
-    vs->in_height = inlink->h;
-    vs->in_fmt = inlink->format;
-
-    if (get_vs_video_format(vs->in_fmt) == pfNone) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported input format: %s\n",
-               av_get_pix_fmt_name(vs->in_fmt));
-        return AVERROR(EINVAL);
-    }
-
-    av_log(ctx, AV_LOG_INFO, "Input configured: %dx%d %s\n",
-           vs->in_width, vs->in_height, av_get_pix_fmt_name(vs->in_fmt));
-
-    return 0;
-}
-
-/**
- * Configure output link.
- */
-static int config_output(AVFilterLink *outlink)
-{
-    /* Output dimensions are set after VapourSynth initialization in activate() */
-    return 0;
-}
-
-/**
  * Initialize filter.
  */
 static av_cold int init(AVFilterContext *ctx)
 {
-    VSContext *vs = ctx->priv;
+    VSContext *vs = (VSContext *)ctx->priv;
 
     vs->ctx = ctx;
     vs->first_pts = AV_NOPTS_VALUE;
@@ -808,15 +757,12 @@ static av_cold int init(AVFilterContext *ctx)
     pthread_cond_init(&vs->vs_wakeup, NULL);
     pthread_cond_init(&vs->input_wakeup, NULL);
 
-    /* Validate script path */
     if (!vs->script_path || !vs->script_path[0]) {
-        av_log(ctx, AV_LOG_ERROR,
-               "No script file specified (use 'file=script.vpy')\n");
+        av_log(ctx, AV_LOG_ERROR, "No script file specified (use 'file=script.vpy')\n");
         return AVERROR(EINVAL);
     }
 
     av_log(ctx, AV_LOG_INFO, "VapourSynth filter initialized: %s\n", vs->script_path);
-
     return 0;
 }
 
@@ -825,10 +771,9 @@ static av_cold int init(AVFilterContext *ctx)
  */
 static av_cold void uninit(AVFilterContext *ctx)
 {
-    VSContext *vs = ctx->priv;
+    VSContext *vs = (VSContext *)ctx->priv;
     int i;
 
-    /* Signal shutdown */
     pthread_mutex_lock(&vs->lock);
     vs->done = 1;
     vs->eof = 1;
@@ -836,7 +781,6 @@ static av_cold void uninit(AVFilterContext *ctx)
     pthread_cond_broadcast(&vs->input_wakeup);
     pthread_mutex_unlock(&vs->lock);
 
-    /* Free VapourSynth resources */
     if (vs->vsapi) {
         if (vs->in_node) {
             vs->vsapi->freeNode(vs->in_node);
@@ -853,13 +797,11 @@ static av_cold void uninit(AVFilterContext *ctx)
         vs->vs_script = NULL;
     }
 
-    /* Free buffered frames */
     for (i = 0; i < vs->num_buffered; i++) {
         if (vs->buffered[i])
             av_frame_free(&vs->buffered[i]);
     }
 
-    /* Free VS frames */
     if (vs->vs_frames && vs->vsapi) {
         for (i = 0; i < vs->max_requests; i++) {
             if (vs->vs_frames[i])
@@ -871,14 +813,13 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&vs->vs_frames);
     av_freep(&vs->vs_frame_numbers);
 
-    /* Destroy threading */
     pthread_cond_destroy(&vs->input_wakeup);
     pthread_cond_destroy(&vs->vs_wakeup);
     pthread_mutex_destroy(&vs->lock);
 }
 
 /**
- * Filter definition.
+ * Filter definition - modern FFmpeg 6.0+ style.
  */
 const FFFilter ff_vf_vapoursynth = {
     .p.name        = "vapoursynth",
@@ -888,8 +829,9 @@ const FFFilter ff_vf_vapoursynth = {
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .query_formats = query_formats,
-    .inputs        = ff_video_default_filterpad,
-    .outputs       = ff_video_default_filterpad,
+    FILTER_INPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    .formats_state = FILTER_FORMATS_QUERY_FUNC2,
+    .query_func2   = query_formats,
     .priv_size     = sizeof(VSContext),
 };
