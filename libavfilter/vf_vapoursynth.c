@@ -55,7 +55,7 @@
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
 
 /* Filter options - need to be named vs_options to match AVFILTER_DEFINE_CLASS */
-static const AVOption vs_options[] = {
+static const AVOption vapoursynth_options[] = {
     { "file",        "VapourSynth script file (.vpy)", OFFSET(script_path),
                       AV_OPT_TYPE_STRING, .flags = FLAGS },
     { "maxbuffer",   "Maximum number of buffered frames", OFFSET(maxbuffer),
@@ -129,13 +129,22 @@ static enum AVPixelFormat vs_to_ff_pix_fmt(const VSVideoFormat *vsfmt)
 /**
  * Copy frame data from FFmpeg AVFrame to VapourSynth VSFrame.
  */
+/**
+ * Get the number of planes for a frame (using its format descriptor).
+ */
+static int get_frame_plane_count(const VSAPI *vsapi, const VSFrame *f)
+{
+    const VSVideoFormat *fmt = vsapi->getVideoFrameFormat(f);
+    return fmt->numPlanes;
+}
+
 static int copy_frame_to_vs(const VSAPI *vsapi, VSFrame *dst,
                             const AVFrame *src)
 {
     const VSVideoFormat *vsfmt = vsapi->getVideoFrameFormat(dst);
     int width = vsapi->getFrameWidth(dst, 0);
     int height = vsapi->getFrameHeight(dst, 0);
-    int num_planes = vsapi->getFramePlaneCount(dst);
+    int num_planes = get_frame_plane_count(vsapi, dst);
     int bytes_per_sample = (vsfmt->bitsPerSample + 7) >> 3;
 
     for (int p = 0; p < num_planes && p < AV_NUM_DATA_POINTERS; p++) {
@@ -169,7 +178,7 @@ static int copy_frame_from_vs(const VSAPI *vsapi, AVFrame *dst,
     const VSVideoFormat *vsfmt = vsapi->getVideoFrameFormat(src);
     int width = vsapi->getFrameWidth(src, 0);
     int height = vsapi->getFrameHeight(src, 0);
-    int num_planes = vsapi->getFramePlaneCount(src);
+    int num_planes = get_frame_plane_count(vsapi, src);
     int bytes_per_sample = (vsfmt->bitsPerSample + 7) >> 3;
 
     enum AVPixelFormat out_fmt = vs_to_ff_pix_fmt(vsfmt);
@@ -831,7 +840,7 @@ const FFFilter ff_vf_vapoursynth = {
     .activate      = activate,
     FILTER_INPUTS(ff_video_default_filterpad),
     FILTER_OUTPUTS(ff_video_default_filterpad),
-    .formats_state = FILTER_FORMATS_QUERY_FUNC2,
+    .formats_state = FF_FILTER_FORMATS_QUERY_FUNC2,
     .query_func2   = query_formats,
     .priv_size     = sizeof(VSContext),
 };
